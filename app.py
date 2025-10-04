@@ -1,24 +1,18 @@
+import json
 import io
-from datetime import datetime, date
-from typing import Dict, List
+import csv
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Tuple
 
-import pandas as pd
 import streamlit as st
 
-# === Google Drive imports ===
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
-from googleapiclient.errors import HttpError
+APP_TITLE = "Weekly Schedule (Helen) — Tick when done"
 
-# =============================
-# CONFIG — SCHEDULE DEFINITIONS
-# =============================
-
-DAYS = ["Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-
-DAILY_TASKS = [
-    "Open windows 10–15 min; Wipe surfaces/Remove dust/tidy up/Remove fur with glove on sofas, chairs, curtain bottoms silently",
+# -----------------------------
+# Task Definitions (Exact text)
+# -----------------------------
+DAILY_TASKS: List[str] = [
+    "Open windows 10–15 min; Wipe sufarces/Remove dust/tidy up/Remove fur with glove on sofas, chairs, curtain bottoms silently",
     "Rinse/wash dishes after meals; dry and clean sink before bedtime",
     "Wipe dining table & kitchen counters after each meal",
     "Sweep or spot-vacuum crumbs in living room/kitchen",
@@ -26,22 +20,29 @@ DAILY_TASKS = [
     "Clean toilets (seat, bowl, rim) + sink; quick shower rinse",
     "Litter room: check 2–3×; sweep spills; wipe majla if dirty (use gloves and wash hands always afterwards)",
     "Wipe stovetop after use; degrease backsplash if splashed",
-    "Take out kitchen & litter trash (wash hands afterwards); replace bags",
+    "Take out kitchen & litter trash ( wash hands afterwards); replace bags",
     "Laundry – sort colors & load machine in the morning",
     "Laundry – fold same day and put away neatly",
     "Wash water pet bowl; refresh water AM/PM",
     "Laundry – iron shirts/pants as needed",
 ]
 
-# every-2-days on Wed, Fri, Sun
-EVERY2_TASKS = [
+# Every 2 days appear on Wed, Fri, Sun (to match your table pattern)
+EVERY2_TASKS: List[str] = [
     "Mop all floors — separate mop (litter room vs house)",
     "Wipe lower window panes & sills throughout the house",
 ]
-EVERY2_DAYS = {"Wednesday", "Friday", "Sunday"}
+EVERY2_SCHEDULE_DAYS = ["Wednesday", "Friday", "Sunday"]
 
-# weekly tasks assigned to a specific weekday
-WEEKLY_TASKS_THU = [
+# Weekly: first group on Saturday; second group on Thursday (per your table)
+WEEKLY_TASKS_SATURDAY: List[str] = [
+    "Oven: remove trays; clean inside, door glass, upper parts",
+    "Microwave: clean inside; wipe handle/exterior",
+    "Fridge: wipe exterior & handles; spot-clean shelves (spills)",
+    "Terrace clean: clean furniture; wash floor; wipe railing",
+    "Disinfect doors, handles, and light switches",
+]
+WEEKLY_TASKS_THURSDAY: List[str] = [
     "Litter tray: empty, wash, refill; scrub surrounding floor",
     "Pantry quick tidy + expiry scan",
     "Squeegee shower tiles after last shower",
@@ -49,290 +50,254 @@ WEEKLY_TASKS_THU = [
     "Clean house entry area",
     "Refill Soap",
 ]
-WEEKLY_TASKS_SAT = [
-    "Oven: remove trays; clean inside, door glass, upper parts",
-    "Microwave: clean inside; wipe handle/exterior",
-    "Fridge: wipe exterior & handles; spot-clean shelves (spills)",
-    "Terrace clean: clean furniture; wash floor; wipe railing",
-    "Disinfect doors, handles, and light switches",
-]
 
-# =========================
-# CONFIG — DRIVE + FILE I/O
-# =========================
-DEFAULT_EXCEL_NAME = "Helen_Weekly_Schedule_Log.xlsx"
+# -----------------------------
+# Helpers
+# -----------------------------
+def slugify(text: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else "-" for ch in text).strip("-")
 
-def _init_drive():
-    """Initialize Google Drive service from st.secrets; return service or None on failure."""
+def get_week_start_wed(d: date) -> date:
+    """Return the Wednesday of the week containing date d."""
+    # Python weekday(): Monday=0 ... Sunday=6. Wednesday=2
+    offset = (d.weekday() - 2) % 7
+    return d - timedelta(days=offset)
+
+def week_days_wed_to_sun(week_start_wed: date) -> List[date]:
+    return [week_start_wed + timedelta(days=i) for i in range(5)]  # Wed..Sun
+
+def fmt_date(d: date) -> str:
+    return d.strftime("%a %d %b %Y")
+
+def today_local() -> date:
+    # Streamlit Cloud uses server time; this is fine for daily ticking.
+    # If you need strict timezone, consider pytz/zoneinfo.
+    return date.today()
+
+# -----------------------------
+# Storage (simple JSON on disk)
+# -----------------------------
+def load_store() -> Dict:
     try:
-        creds_dict = st.secrets.get("gdrive")
-        if not creds_dict:
-            return None
-        creds = service_account.Credentials.from_service_account_info(
-            creds_dict,
-            scopes=["https://www.googleapis.com/auth/drive.file"]
-        )
-        service = build("drive", "v3", credentials=creds)
-        return service
-    except Exception as e:
-        st.warning(f"Google Drive not configured (using local fallback). Details: {e}")
-        return None
-
-
-def _find_file(service, name: str) -> str:
-    """Return file ID if a Drive file with this name exists (and not trashed), else ''."""
-    try:
-        q = f"name = '{name}' and mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' and trashed = false"
-        resp = service.files().list(q=q, spaces="drive", fields="files(id, name)").execute()
-        files = resp.get("files", [])
-        return files[0]["id"] if files else ""
-    except HttpError as e:
-        st.error(f"Drive search error: {e}")
-        return ""
-
-
-def _empty_log_excel_bytes() -> bytes:
-    """Create a minimal Excel workbook (in-memory) with a 'log' sheet and no rows."""
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        df = pd.DataFrame(columns=["timestamp", "date", "day", "task", "completed", "note"])
-        df.to_excel(writer, sheet_name="log", index=False)
-    return out.getvalue()
-
-
-def _create_drive_file(service, name: str, parent_folder_id: str = "") -> str:
-    """Create a new Excel file on Drive and return its file ID."""
-    file_metadata = {"name": name, "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
-    if parent_folder_id:
-        file_metadata["parents"] = [parent_folder_id]
-    media = MediaIoBaseUpload(io.BytesIO(_empty_log_excel_bytes()),
-                              mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                              resumable=False)
-    created = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-    return created["id"]
-
-
-def _download_excel(service, file_id: str) -> bytes:
-    """Download the Excel file bytes from Drive."""
-    request = service.files().get_media(fileId=file_id)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    return buf.getvalue()
-
-
-def _upload_excel(service, file_id: str, data: bytes):
-    """Upload (update) the Excel file on Drive."""
-    media = MediaIoBaseUpload(io.BytesIO(data),
-                              mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                              resumable=False)
-    service.files().update(fileId=file_id, media_body=media).execute()
-
-
-def _load_log_df_from_bytes(xls_bytes: bytes) -> pd.DataFrame:
-    try:
-        with pd.ExcelFile(io.BytesIO(xls_bytes)) as xls:
-            if "log" in xls.sheet_names:
-                return pd.read_excel(xls, sheet_name="log")
-            else:
-                return pd.DataFrame(columns=["timestamp", "date", "day", "task", "completed", "note"])
+        with open("progress.json", "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return pd.DataFrame(columns=["timestamp", "date", "day", "task", "completed", "note"])
+        return {}
 
+def save_store(store: Dict):
+    with open("progress.json", "w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False, indent=2)
 
-def _save_log_df_to_bytes(df: pd.DataFrame) -> bytes:
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="log", index=False)
-    return out.getvalue()
+def get_week_key(week_start_wed: date) -> str:
+    return week_start_wed.isoformat()
 
+def default_week_state() -> Dict[str, Dict[str, bool]]:
+    return {}  # day -> task_slug -> bool
 
-# ==================
-# APP HELPER LOGIC
-# ==================
+def ensure_week_initialized(store: Dict, week_key: str):
+    if "weeks" not in store:
+        store["weeks"] = {}
+    if week_key not in store["weeks"]:
+        store["weeks"][week_key] = default_week_state()
 
-def weekday_name(d: date) -> str:
-    return d.strftime("%A")
+# -----------------------------
+# Task schedule logic
+# -----------------------------
+ALL_DAYS = ["Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
+def tasks_due_on(day_name: str) -> List[Tuple[str, str]]:
+    """Return list of (section, task_text) for tasks due on the given day."""
+    due = []
+    # Daily
+    for t in DAILY_TASKS:
+        due.append(("DAILY", t))
 
-def tasks_for_day(day_name: str) -> List[str]:
-    """Return the list of tasks scheduled for the provided day name."""
-    tasks = list(DAILY_TASKS)
+    # Every 2 days
+    if day_name in EVERY2_SCHEDULE_DAYS:
+        for t in EVERY2_TASKS:
+            due.append(("EVERY 2 DAYS", t))
 
-    if day_name in EVERY2_DAYS:
-        tasks.extend(EVERY2_TASKS)
-
+    # Weekly (Thu group / Sat group)
     if day_name == "Thursday":
-        tasks.extend(WEEKLY_TASKS_THU)
+        for t in WEEKLY_TASKS_THURSDAY:
+            due.append(("WEEKLY", t))
     if day_name == "Saturday":
-        tasks.extend(WEEKLY_TASKS_SAT)
+        for t in WEEKLY_TASKS_SATURDAY:
+            due.append(("WEEKLY", t))
 
-    return tasks
+    return due
 
-
-def latest_status_map(log_df: pd.DataFrame, target_date: date) -> Dict[str, bool]:
-    """For a given date, return the latest completion status per task (True/False)."""
-    if log_df.empty:
-        return {}
-    dstr = target_date.isoformat()
-    sub = log_df[log_df["date"] == dstr]
-    if sub.empty:
-        return {}
-    sub = sub.sort_values("timestamp")
-    latest = sub.groupby("task").tail(1)
-    return {row["task"]: bool(row["completed"]) for _, row in latest.iterrows()}
-
-
-def upsert_log(log_df: pd.DataFrame, target_date: date, day_name: str,
-               task_status: Dict[str, bool], note: str) -> pd.DataFrame:
-    """Append new rows for today's status (append-only log)."""
-    now = datetime.utcnow().isoformat()
+def all_tasks_for_week() -> List[Tuple[str, str, List[str]]]:
+    """
+    For exporting CSV: return tuples of (section, task_text, days_scheduled)
+    """
     rows = []
-    for task, done in task_status.items():
-        rows.append({
-            "timestamp": now,
-            "date": target_date.isoformat(),
-            "day": day_name,
-            "task": task,
-            "completed": 1 if done else 0,
-            "note": note if note else "",
-        })
-    to_add = pd.DataFrame(rows)
-    if log_df.empty:
-        return to_add
-    return pd.concat([log_df, to_add], ignore_index=True)
+    for t in DAILY_TASKS:
+        rows.append(("DAILY", t, ALL_DAYS))
+    for t in EVERY2_TASKS:
+        rows.append(("EVERY 2 DAYS", t, EVERY2_SCHEDULE_DAYS))
+    rows.extend([("WEEKLY", t, ["Saturday"]) for t in WEEKLY_TASKS_SATURDAY])
+    rows.extend([("WEEKLY", t, ["Thursday"]) for t in WEEKLY_TASKS_THURSDAY])
+    return rows
 
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title=APP_TITLE, page_icon="✅", layout="centered")
+st.title(APP_TITLE)
 
-# =========
-#   UI
-# =========
-
-st.set_page_config(page_title="Weekly Schedule (Helen)", page_icon="✅", layout="centered")
-
-st.title("Weekly Schedule (Helen) — Tick ☑ when done")
-
+# Sidebar controls
 with st.sidebar:
-    st.markdown("### How it works")
-    st.write(
-        "- Choose the date. The app loads only tasks **scheduled** for that weekday (Wed–Sun).\n"
-        "- Tick tasks as you complete them. Add a short note if needed.\n"
-        "- Click **Save** to record to an Excel file on Google Drive.\n"
-        "- Next time you open the same date, the last saved ticks will prefill."
-    )
+    st.header("Controls")
+    chosen_date = st.date_input("Select a date", value=today_local())
+    week_start = get_week_start_wed(chosen_date)
+    week_label = f"Week: {fmt_date(week_start)} → {fmt_date(week_start + timedelta(days=4))} (Wed→Sun)"
+    st.markdown(f"**{week_label}**")
+
+    # Determine day index and name within Wed→Sun
+    days = week_days_wed_to_sun(week_start)
+    day_options = {d.strftime("%A"): d for d in days}  # "Wednesday": date
+    # Pick the day matching chosen_date if within Wed-Sun, otherwise default to Wednesday
+    if chosen_date in days:
+        default_day_name = chosen_date.strftime("%A")
+    else:
+        default_day_name = "Wednesday"
+
+    day_name = st.selectbox("Day to tick", options=list(day_options.keys()), index=list(day_options.keys()).index(default_day_name))
+
     st.markdown("---")
-    st.markdown("### Drive setup")
-    st.write(
-        "Add your service account JSON to `st.secrets['gdrive']` and (optionally):\n"
-        "- `st.secrets['app']['drive_file_name']` (default: Helen_Weekly_Schedule_Log.xlsx)\n"
-        "- `st.secrets['app']['parent_folder_id']` (optional Drive folder ID)\n"
-        "Share the folder with the service account email."
-    )
+    st.caption("💾 Save / Restore")
+    uploaded = st.file_uploader("Restore progress (.json)", type=["json"], help="Upload a previously downloaded progress.json")
+    col_d1, col_d2 = st.columns(2)
+    with col_d1:
+        download_json_btn = st.button("⬇️ Download progress JSON")
+    with col_d2:
+        download_csv_btn = st.button("⬇️ Download this week as CSV")
 
-today = date.today()
-sel_date = st.date_input("Select date", value=today, format="YYYY-MM-DD")
-sel_day = weekday_name(sel_date)
+    st.markdown("---")
+    st.caption("⚠️ Reset")
+    reset_day = st.button("Reset selected day")
+    reset_week = st.button("Reset entire week")
 
-if sel_day not in DAYS:
-    st.info(
-        f"Selected day is **{sel_day}**. Helen typically works **Wednesday–Sunday**. "
-        "You can still save progress for this date."
-    )
+# Load/restore progress store
+store = load_store()
 
-# Load log (Drive or local)
-service = _init_drive()
-fname = st.secrets.get("app", {}).get("drive_file_name", DEFAULT_EXCEL_NAME)
-parent_folder_id = st.secrets.get("app", {}).get("parent_folder_id", "")
-
-log_df = pd.DataFrame(columns=["timestamp", "date", "day", "task", "completed", "note"])
-file_id = ""
-loaded_from_drive = False
-
-if service is not None:
-    file_id = _find_file(service, fname)
+# Handle uploaded progress
+if uploaded is not None:
     try:
-        if not file_id:
-            file_id = _create_drive_file(service, fname, parent_folder_id)
-        xls_bytes = _download_excel(service, file_id)
-        log_df = _load_log_df_from_bytes(xls_bytes)
-        loaded_from_drive = True
+        uploaded_store = json.load(uploaded)
+        # Simple replace strategy; you could also merge
+        store = uploaded_store
+        save_store(store)
+        st.success("Progress restored from uploaded file.")
     except Exception as e:
-        st.warning(f"Drive access fallback to local (temp). Reason: {e}")
+        st.error(f"Could not read uploaded JSON: {e}")
 
-# Prefill state from log
-prefill = latest_status_map(log_df, sel_date)
+# Ensure current week initialized
+week_key = get_week_key(week_start)
+ensure_week_initialized(store, week_key)
 
-st.subheader(f"Tasks for {sel_day}")
-st.caption("Tip: start with quiet tasks (opening windows, tidying) before any noisy tasks like hoovering.")
+# Initialize day state map
+if day_name not in store["weeks"][week_key]:
+    store["weeks"][week_key][day_name] = {}
 
-def render_section(title: str, task_list: List[str]) -> Dict[str, bool]:
-    st.markdown(f"#### {title}")
-    check_all = st.checkbox(f"Check all in {title}", key=f"all_{title}_{sel_date.isoformat()}")
-    states = {}
-    for task in task_list:
-        default_val = prefill.get(task, False)
-        val = check_all or st.checkbox(task, value=default_val, key=f"{sel_date.isoformat()}::{task}")
-        states[task] = bool(val)
-    st.divider()
-    return states
+# Reset actions
+if reset_day:
+    store["weeks"][week_key][day_name] = {}
+    save_store(store)
+    st.warning(f"All ticks cleared for **{day_name}**.", icon="⚠️")
 
-# Build visible sections based on selected day
-daily_states = render_section("DAILY TASKS", DAILY_TASKS)
+if reset_week:
+    store["weeks"][week_key] = {}
+    save_store(store)
+    st.warning("All ticks cleared for the **entire week**.", icon="⚠️")
 
-every2_states = {}
-if sel_day in {"Wednesday", "Friday", "Sunday"}:
-    every2_states = render_section("EVERY 2 DAYS", EVERY2_TASKS)
+# Due tasks for selected day
+due = tasks_due_on(day_name)
 
-weekly_states = {}
-if sel_day == "Thursday":
-    weekly_states = render_section("WEEKLY TASKS (Thursday)", WEEKLY_TASKS_THU)
-elif sel_day == "Saturday":
-    weekly_states = render_section("WEEKLY TASKS (Saturday)", WEEKLY_TASKS_SAT)
+# Sectioned layout
+st.subheader(f"Tasks due on **{day_name}**")
+st.caption("Tick tasks as you complete them. Daily tasks always appear. ‘Every 2 Days’ and ‘Weekly’ show only on their scheduled days.")
 
-# Notes
-note = st.text_area("Notes for today (optional)", placeholder="e.g., Ran out of trash bags, microwave very dirty today, etc.")
+# Quick actions
+qc1, qc2 = st.columns(2)
+with qc1:
+    mark_all = st.button("Mark all done ✅")
+with qc2:
+    clear_all = st.button("Clear all ⭕")
 
-# Merge all visible tasks for saving
-all_states = {**daily_states, **every2_states, **weekly_states}
+day_state: Dict[str, bool] = store["weeks"][week_key].get(day_name, {})
+
+# Apply quick actions (in-memory first)
+if mark_all:
+    for _, task in due:
+        day_state[slugify(task)] = True
+if clear_all:
+    for _, task in due:
+        day_state[slugify(task)] = False
+
+# Render tasks grouped by section
+section_order = ["DAILY", "EVERY 2 DAYS", "WEEKLY"]
+for section in section_order:
+    section_tasks = [t for sec, t in due if sec == section]
+    if not section_tasks:
+        continue
+    st.markdown(f"### {section}")
+    for task in section_tasks:
+        key = slugify(task)
+        current_val = day_state.get(key, False)
+        new_val = st.checkbox(task, value=current_val, key=f"{day_name}-{key}")
+        day_state[key] = new_val
 
 # Save button
-save = st.button("💾 Save to Google Drive", type="primary")
+if st.button("Save progress 💾"):
+    # Persist updated day_state
+    store["weeks"][week_key][day_name] = day_state
+    save_store(store)
+    st.success("Progress saved.", icon="✅")
 
-if save:
-    if not all_states:
-        st.warning("No tasks visible to save for this day.")
-    else:
-        new_log = upsert_log(log_df, sel_date, sel_day, all_states, note)
+# Download buttons (generate files when clicked)
+if download_json_btn:
+    # Ensure latest UI state is saved before export
+    store["weeks"][week_key][day_name] = day_state
+    json_bytes = json.dumps(store, ensure_ascii=False, indent=2).encode("utf-8")
+    st.download_button(
+        label="Download progress.json",
+        data=json_bytes,
+        file_name="progress.json",
+        mime="application/json",
+    )
 
-        if loaded_from_drive and service is not None and file_id:
-            try:
-                data_bytes = _save_log_df_to_bytes(new_log)
-                _upload_excel(service, file_id, data_bytes)
-                st.success(f"Saved to Google Drive file: {fname}")
-            except Exception as e:
-                st.error(f"Failed to save to Drive ({e}). Attempting local save...")
-                data_bytes = _save_log_df_to_bytes(new_log)
-                with open("local_log.xlsx", "wb") as f:
-                    f.write(data_bytes)
-                st.info("Saved to local file 'local_log.xlsx' (temporary).")
-        else:
-            data_bytes = _save_log_df_to_bytes(new_log)
-            with open("local_log.xlsx", "wb") as f:
-                f.write(data_bytes)
-            st.success("Saved locally to 'local_log.xlsx' (temporary). Configure Drive to persist.")
-        st.balloons()
+if download_csv_btn:
+    # Build a CSV showing full week plan + current ticks
+    rows = []
+    tasks_plan = all_tasks_for_week()
+    for section, task, scheduled_days in tasks_plan:
+        for dname in ALL_DAYS:
+            is_scheduled = dname in scheduled_days
+            val = ""
+            if is_scheduled:
+                # lookup saved state if exists
+                week_map = store["weeks"].get(week_key, {})
+                day_map = week_map.get(dname, {})
+                val = "✅" if day_map.get(slugify(task), False) else "☐"
+            rows.append([section, task, dname, "Yes" if is_scheduled else "No", val])
 
-# History / Summary for the selected date
-st.markdown("### Today’s Summary")
-done_count = sum(1 for v in all_states.values() if v)
-st.write(f"Completed **{done_count}** of **{len(all_states)}** visible tasks.")
-if done_count and len(all_states):
-    done_list = [t for t, v in all_states.items() if v]
-    st.write("✅ Done:")
-    st.write("\\n".join(f"- {t}" for t in done_list))
-else:
-    st.caption("No tasks ticked yet.")
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["Section", "Task", "Day", "Scheduled", "Done"])
+    writer.writerows(rows)
+    st.download_button(
+        label="Download week.csv",
+        data=out.getvalue().encode("utf-8-sig"),
+        file_name="week.csv",
+        mime="text/csv",
+    )
 
+# Footer tip
 st.markdown("---")
-st.caption("If the helper only uses a phone, enable wide mode from the ☰ menu for larger checkboxes.")
+st.caption(
+    "Tip: Use the **sidebar date** to jump to any day (Wed→Sun). "
+    "Click **Save progress** or download **progress.json** to keep a copy. "
+    "You can restore it later from the sidebar."
+)
