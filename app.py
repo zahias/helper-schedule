@@ -6,50 +6,11 @@ st.set_page_config(page_title="Weekly Schedule (Helen)", page_icon="✅", layout
 
 APP_TITLE = "Weekly Schedule (Helen) — Tick when done"
 
-# --- Mobile-friendly CSS (bigger text, pill day picker, comfy spacing) ---
-st.markdown(
-    """
-    <style>
-    /* Larger base font on small screens */
-    @media (max-width: 680px) {
-      html, body, .block-container { font-size: 17px; }
-    }
-    /* Tight top/bottom padding */
-    .block-container { padding-top: 0.5rem; padding-bottom: 2rem; }
-
-    /* Horizontally scrollable radio as 'pills' */
-    div[role="radiogroup"] {
-      display: flex !important;
-      gap: 8px;
-      overflow-x: auto;
-      white-space: nowrap;
-      padding: 0.25rem 0 0.5rem 0;
-    }
-    div[role="radiogroup"] > label {
-      border: 1px solid #e6e6e6 !important;
-      border-radius: 999px !important;
-      padding: 0.4rem 0.8rem !important;
-      margin: 0 !important;
-      background: #fafafa;
-    }
-    /* Make checkbox labels more tappable */
-    label { line-height: 1.35; }
-    /* Subtle sticky progress bar area */
-    .sticky {
-      position: sticky; top: 0; z-index: 10;
-      background: white; padding: 0.4rem 0 0.6rem 0; margin: 0 0 0.2rem 0;
-      border-bottom: 1px solid #f0f0f0;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 # -----------------------------
-# Task lists (exact text you provided)
+# Task lists (your exact list, with 'surfaces' typo fixed)
 # -----------------------------
 DAILY_TASKS = [
-    "Open windows 10–15 min; Wipe sufarces/Remove dust/tidy up/Remove fur with glove on sofas, chairs, curtain bottoms silently",
+    "Open windows 10–15 min; Wipe surfaces/Remove dust/tidy up/Remove fur with glove on sofas, chairs, curtain bottoms silently",
     "Rinse/wash dishes after meals; dry and clean sink before bedtime",
     "Wipe dining table & kitchen counters after each meal",
     "Sweep or spot-vacuum crumbs in living room/kitchen",
@@ -68,7 +29,7 @@ EVERY2_TASKS = [
     "Mop all floors — separate mop (litter room vs house)",
     "Wipe lower window panes & sills throughout the house",
 ]
-EVERY2_DAYS = ["Wednesday", "Friday", "Sunday"]  # shows only on these days
+EVERY2_DAYS = ["Wednesday", "Friday", "Sunday"]
 
 WEEKLY_TASKS_THU = [
     "Litter tray: empty, wash, refill; scrub surrounding floor",
@@ -101,8 +62,68 @@ def tasks_for_day(day: str):
         groups.append(("WEEKLY TASKS", WEEKLY_TASKS_SAT))
     return groups
 
-# --- UI ---
+# -----------------------------
+# UI
+# -----------------------------
 st.title(APP_TITLE)
+
+# Simple text-size control (big, bigger, biggest)
+size_choice = st.radio(
+    "Text size",
+    ["Normal", "Large", "Extra Large"],
+    horizontal=True,
+    index=1,  # default to Large
+)
+
+# Map sizes to CSS vars
+size_map = {
+    "Normal": {"base": 17, "check": 18, "radio": 16, "scale": 1.00},
+    "Large": {"base": 19, "check": 20, "radio": 18, "scale": 1.12},
+    "Extra Large": {"base": 21, "check": 22, "radio": 20, "scale": 1.25},
+}
+S = size_map[size_choice]
+
+# Mobile-friendly CSS for readability
+st.markdown(
+    f"""
+    <style>
+    html, body, .block-container {{ font-size: {S['base']}px; }}
+    .block-container {{ padding-top: 0.5rem; padding-bottom: 2rem; }}
+
+    /* Day picker: horizontal pills + larger text */
+    div[role="radiogroup"] {{
+      display: flex !important;
+      gap: 8px;
+      overflow-x: auto;
+      white-space: nowrap;
+      padding: 0.25rem 0 0.5rem 0;
+    }}
+    div[role="radiogroup"] > label {{
+      border: 1px solid #e6e6e6 !important;
+      border-radius: 999px !important;
+      padding: 0.45rem 0.9rem !important;
+      margin: 0 !important;
+      background: #fafafa;
+      font-size: {S['radio']}px !important;
+    }}
+
+    /* Bigger checkbox labels + comfy line height */
+    div[data-testid="stCheckbox"] label {{
+      font-size: {S['check']}px !important;
+      line-height: 1.5 !important;
+    }}
+    /* Slightly enlarge the checkbox hit area */
+    div[data-testid="stCheckbox"] input {{
+      transform: scale({S['scale']});
+      margin-right: 6px;
+    }}
+
+    /* Make section headers stand out a bit more on mobile */
+    h3, h2 {{ margin-top: 0.8rem; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # Day picker (mobile-friendly horizontal radio)
 today_name = date.today().strftime("%A")
@@ -111,7 +132,7 @@ day = st.radio("Choose the day", DAYS, horizontal=True, index=default_idx, label
 
 groups = tasks_for_day(day)
 
-# Progress (sticky)
+# Progress
 def progress_counts(day_name: str):
     total = 0
     done = 0
@@ -122,29 +143,29 @@ def progress_counts(day_name: str):
                 done += 1
     return done, total
 
-with st.container():
-    st.markdown('<div class="sticky">', unsafe_allow_html=True)
-    done, total = progress_counts(day)
-    pct = int(100 * done / total) if total else 0
-    st.write(f"**Progress for {day}: {done} / {total} ({pct}%)**")
-    st.progress(pct)
-    cols = st.columns(2)
-    if cols[0].button("Mark all done ✅"):
-        for _, items in groups:
-            for t in items:
-                st.session_state[slug(day, t)] = True
-        st.rerun()
-    if cols[1].button("Reset today ⭕"):
-        for _, items in groups:
-            for t in items:
-                st.session_state[slug(day, t)] = False
-        st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+done, total = progress_counts(day)
+pct = int(100 * done / total) if total else 0
+st.write(f"**Progress for {day}: {done} / {total} ({pct}%)**")
+st.progress(pct)
 
-# Checklist (simple, big targets)
+left, right = st.columns(2)
+if left.button("Mark all done ✅"):
+    for _, items in groups:
+        for t in items:
+            st.session_state[slug(day, t)] = True
+    st.rerun()
+if right.button("Reset today ⭕"):
+    for _, items in groups:
+        for t in items:
+            st.session_state[slug(day, t)] = False
+    st.rerun()
+
+st.divider()
+
+# Checklist (simple)
 for section, items in groups:
     st.subheader(section)
     for t in items:
         st.checkbox(t, key=slug(day, t))
 
-st.caption("Tip: Swipe the day selector if it overflows. Tick tasks as you finish them.")
+st.caption("Tip: Swipe the day selector if it overflows. Increase text size above if needed.")
